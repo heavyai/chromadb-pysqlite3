@@ -47,6 +47,18 @@ __settings = Settings()
 
 __version__ = "0.5.3"
 
+
+def is_in_colab() -> bool:
+    try:
+        import google.colab  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+IN_COLAB = is_in_colab()
+
 is_client = False
 try:
     from chromadb.is_thin_client import is_thin_client
