@@ -1,6 +1,6 @@
 [project]
-name = "chromadb"
-dynamic = ["version"]
+name = "chromadb-pysqlite3"
+version = "0.5.1"
 
 authors = [
   { name = "Jeff Huber", email = "jeff@trychroma.com" },
