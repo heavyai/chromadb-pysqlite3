@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       outside-docs: ${{ steps.changes.outputs.outside-docs }}
+      docs: ${{ steps.changes.outputs.docs }}
     steps:
       - name: Get changed paths
         id: changes
@@ -22,7 +23,6 @@ jobs:
           filters: |
             outside-docs:
               - '!docs/**'
-              - '!.github/**'
             docs:
               - 'docs/**'
 
@@ -30,7 +30,7 @@ jobs:
     name: Deploy preview of docs
     needs: paths-filter
     if: needs.paths-filter.outputs.docs == 'true'
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-22.04-small
     environment:
       name: Preview
       url: ${{ steps.deploy.outputs.url }}

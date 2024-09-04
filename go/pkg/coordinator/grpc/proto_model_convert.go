@@ -40,13 +40,14 @@ func convertCollectionToProto(collection *model.Collection) *coordinatorpb.Colle
 	}
 
 	collectionpb := &coordinatorpb.Collection{
-		Id:          collection.ID.String(),
-		Name:        collection.Name,
-		Dimension:   collection.Dimension,
-		Tenant:      collection.TenantID,
-		Database:    collection.DatabaseName,
-		LogPosition: collection.LogPosition,
-		Version:     collection.Version,
+		Id:                   collection.ID.String(),
+		Name:                 collection.Name,
+		ConfigurationJsonStr: collection.ConfigurationJsonStr,
+		Dimension:            collection.Dimension,
+		Tenant:               collection.TenantID,
+		Database:             collection.DatabaseName,
+		LogPosition:          collection.LogPosition,
+		Version:              collection.Version,
 	}
 	if collection.Metadata == nil {
 		return collectionpb
@@ -111,13 +112,14 @@ func convertToCreateCollectionModel(req *coordinatorpb.CreateCollectionRequest) 
 	}
 
 	return &model.CreateCollection{
-		ID:           collectionID,
-		Name:         req.Name,
-		Dimension:    req.Dimension,
-		Metadata:     metadata,
-		GetOrCreate:  req.GetGetOrCreate(),
-		TenantID:     req.GetTenant(),
-		DatabaseName: req.GetDatabase(),
+		ID:                   collectionID,
+		Name:                 req.Name,
+		ConfigurationJsonStr: req.ConfigurationJsonStr,
+		Dimension:            req.Dimension,
+		Metadata:             metadata,
+		GetOrCreate:          req.GetGetOrCreate(),
+		TenantID:             req.GetTenant(),
+		DatabaseName:         req.GetDatabase(),
 	}, nil
 }
 
@@ -166,15 +168,9 @@ func convertSegmentToProto(segment *model.Segment) *coordinatorpb.Segment {
 		Id:         segment.ID.String(),
 		Type:       segment.Type,
 		Scope:      segmentSceope,
-		Collection: nil,
+		Collection: segment.CollectionID.String(),
 		Metadata:   nil,
 		FilePaths:  filePaths,
-	}
-
-	collectionID := segment.CollectionID
-	if collectionID != types.NilUniqueID() {
-		collectionIDString := collectionID.String()
-		segmentpb.Collection = &collectionIDString
 	}
 
 	if segment.Metadata == nil {
@@ -224,9 +220,9 @@ func convertSegmentToModel(segmentpb *coordinatorpb.Segment) (*model.CreateSegme
 		return nil, common.ErrSegmentIDFormat
 	}
 
-	collectionID, err := types.ToUniqueID(segmentpb.Collection)
+	collectionID, err := types.ToUniqueID(&segmentpb.Collection)
 	if err != nil {
-		log.Error("collection id format error", zap.String("collectionpd.id", *segmentpb.Collection))
+		log.Error("collection id format error", zap.String("collectionpd.id", segmentpb.Collection))
 		return nil, common.ErrCollectionIDFormat
 	}
 

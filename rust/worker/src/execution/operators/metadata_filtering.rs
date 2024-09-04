@@ -1,35 +1,28 @@
 use crate::{
-    blockstore::{key::KeyWrapper, provider::BlockfileProvider},
-    errors::{ChromaError, ErrorCodes},
-    execution::{data::data_chunk::Chunk, operator::Operator},
-    index::{
-        fulltext::types::process_where_document_clause_with_callback,
-        metadata::types::{process_where_clause_with_callback, MetadataIndexError},
-    },
+    execution::operator::Operator,
     segment::{
         metadata_segment::{MetadataSegmentError, MetadataSegmentReader},
         record_segment::{RecordSegmentReader, RecordSegmentReaderCreationError},
-        LogMaterializer, LogMaterializerError, MaterializedLogRecord,
+        LogMaterializer, LogMaterializerError,
     },
-    types::{
-        LogRecord, MetadataValue, Operation, Segment, Where, WhereClauseComparator, WhereDocument,
-        WhereDocumentOperator,
-    },
+};
+use chroma_blockstore::{key::KeyWrapper, provider::BlockfileProvider};
+use chroma_error::{ChromaError, ErrorCodes};
+use chroma_index::{
+    fulltext::types::process_where_document_clause_with_callback,
+    metadata::types::{process_where_clause_with_callback, MetadataIndexError},
     utils::{merge_sorted_vecs_conjunction, merge_sorted_vecs_disjunction},
 };
-use core::panic;
-use futures::stream::Count;
-use regex::Regex;
-use roaring::RoaringBitmap;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::{
-        atomic::{AtomicU16, AtomicU32},
-        Arc,
-    },
+use chroma_types::{
+    Chunk, LogRecord, MaterializedLogOperation, MetadataValue, Operation, Segment, Where,
+    WhereClauseComparator, WhereDocument, WhereDocumentOperator,
 };
+use core::panic;
+use roaring::RoaringBitmap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use tonic::async_trait;
+use tracing::{Instrument, Span};
 
 #[derive(Debug)]
 pub(crate) struct MetadataFilteringOperator {}
@@ -118,6 +111,11 @@ impl ChromaError for MetadataFilteringError {
 #[async_trait]
 impl Operator<MetadataFilteringInput, MetadataFilteringOutput> for MetadataFilteringOperator {
     type Error = MetadataFilteringError;
+
+    fn get_name(&self) -> &'static str {
+        "MetadataFilteringOperator"
+    }
+
     async fn run(
         &self,
         input: &MetadataFilteringInput,
@@ -155,7 +153,11 @@ impl Operator<MetadataFilteringInput, MetadataFilteringOutput> for MetadataFilte
         // Step 1: Materialize the logs.
         let materializer =
             LogMaterializer::new(record_segment_reader, input.log_record.clone(), None);
-        let mat_records = match materializer.materialize().await {
+        let mat_records = match materializer
+            .materialize()
+            .instrument(tracing::trace_span!(parent: Span::current(), "Materialize logs"))
+            .await
+        {
             Ok(records) => records,
             Err(e) => {
                 return Err(MetadataFilteringError::MetadataFilteringLogMaterializationError(e));
@@ -169,17 +171,17 @@ impl Operator<MetadataFilteringInput, MetadataFilteringOutput> for MetadataFilte
             // so that they can be ignored when reading from the segment later.
             ids_in_mat_log.insert(records.offset_id);
             // Skip deleted records.
-            if records.final_operation == Operation::Delete {
+            if records.final_operation == MaterializedLogOperation::DeleteExisting {
                 continue;
             }
             ids_to_metadata.insert(records.offset_id, records.merged_metadata_ref());
         }
         let clo = |metadata_key: &str,
-                   metadata_value: &crate::blockstore::key::KeyWrapper,
-                   metadata_type: crate::types::MetadataType,
+                   metadata_value: &chroma_blockstore::key::KeyWrapper,
+                   metadata_type: chroma_types::MetadataType,
                    comparator: WhereClauseComparator| {
             match metadata_type {
-                crate::types::MetadataType::StringType => match comparator {
+                chroma_types::MetadataType::StringType => match comparator {
                     WhereClauseComparator::Equal => {
                         let mut result = RoaringBitmap::new();
                         // Construct a bitmap consisting of all offset ids
@@ -217,7 +219,7 @@ impl Operator<MetadataFilteringInput, MetadataFilteringOutput> for MetadataFilte
                         unimplemented!();
                     }
                 },
-                crate::types::MetadataType::BoolType => match comparator {
+                chroma_types::MetadataType::BoolType => match comparator {
                     WhereClauseComparator::Equal => {
                         let mut result = RoaringBitmap::new();
                         // Construct a bitmap consisting of all offset ids
@@ -255,7 +257,7 @@ impl Operator<MetadataFilteringInput, MetadataFilteringOutput> for MetadataFilte
                         unimplemented!();
                     }
                 },
-                crate::types::MetadataType::IntType => match comparator {
+                chroma_types::MetadataType::IntType => match comparator {
                     WhereClauseComparator::Equal => {
                         let mut result = RoaringBitmap::new();
                         // Construct a bitmap consisting of all offset ids
@@ -360,7 +362,7 @@ impl Operator<MetadataFilteringInput, MetadataFilteringOutput> for MetadataFilte
                         return result;
                     }
                 },
-                crate::types::MetadataType::DoubleType => match comparator {
+                chroma_types::MetadataType::DoubleType => match comparator {
                     WhereClauseComparator::Equal => {
                         let mut result = RoaringBitmap::new();
                         // Construct a bitmap consisting of all offset ids
@@ -465,16 +467,16 @@ impl Operator<MetadataFilteringInput, MetadataFilteringOutput> for MetadataFilte
                         return result;
                     }
                 },
-                crate::types::MetadataType::StringListType => {
+                chroma_types::MetadataType::StringListType => {
                     todo!();
                 }
-                crate::types::MetadataType::IntListType => {
+                chroma_types::MetadataType::IntListType => {
                     todo!();
                 }
-                crate::types::MetadataType::DoubleListType => {
+                chroma_types::MetadataType::DoubleListType => {
                     todo!();
                 }
-                crate::types::MetadataType::BoolListType => {
+                chroma_types::MetadataType::BoolListType => {
                     todo!();
                 }
             }
@@ -509,16 +511,20 @@ impl Operator<MetadataFilteringInput, MetadataFilteringOutput> for MetadataFilte
                     let mut matching_contains = vec![];
                     // Upstream sorts materialized records by offset id so matching_contains
                     // will be sorted.
+                    // Note: Uncomment this out when adding FTS support for queries
+                    // containing _ or %. Currently, we disable such scenarios in tests
+                    // for distributed version.
                     // Emulate sqlite behavior. _ and % match to any character in sqlite.
-                    let normalized_query = query.replace("_", ".").replace("%", ".");
-                    let re = Regex::new(normalized_query.as_str()).unwrap();
+                    // let normalized_query = query.replace("_", ".").replace("%", ".");
+                    // let re = Regex::new(normalized_query.as_str()).unwrap();
                     for (record, _) in mat_records.iter() {
-                        if record.final_operation == Operation::Delete {
+                        if record.final_operation == MaterializedLogOperation::DeleteExisting {
                             continue;
                         }
                         match record.merged_document_ref() {
                             Some(doc) => {
-                                if re.is_match(doc) {
+                                /* if re.is_match(doc) { */
+                                if doc.contains(query) {
                                     matching_contains.push(record.offset_id as i32);
                                 }
                             }
@@ -567,54 +573,50 @@ impl Operator<MetadataFilteringInput, MetadataFilteringOutput> for MetadataFilte
                 &fts_result.expect("Already validated that it is not none"),
             ));
         }
-        // Get offset ids that satisfy where conditions from storage.
-        let metadata_segment_reader =
-            MetadataSegmentReader::from_segment(&input.metadata_segment, &input.blockfile_provider)
-                .await;
 
-        let filtered_index_offset_ids = match metadata_segment_reader {
-            Ok(reader) => {
-                reader
-                    .query(
-                        input.where_clause.as_ref(),
-                        input.where_document_clause.as_ref(),
-                        Some(&vec![]),
-                        0,
-                        0,
-                    )
-                    .await
-            }
-            Err(e) => {
-                tracing::error!("Error querying metadata segment: {:?}", e);
-                return Err(MetadataFilteringError::MetadataFilteringMetadataSegmentReaderError(e));
-            }
-        };
+        let mut filtered_index_offset_ids: Option<Vec<usize>> = None;
+        if input.where_clause.is_some() || input.where_document_clause.is_some() {
+            // Get offset ids that satisfy where conditions from storage.
+            let metadata_segment_reader = MetadataSegmentReader::from_segment(
+                &input.metadata_segment,
+                &input.blockfile_provider,
+            )
+            .await
+            .map_err(|e| MetadataFilteringError::MetadataFilteringMetadataSegmentReaderError(e))?;
+
+            filtered_index_offset_ids = metadata_segment_reader
+                .query(
+                    input.where_clause.as_ref(),
+                    input.where_document_clause.as_ref(),
+                    Some(&vec![]),
+                    0,
+                    0,
+                )
+                .await
+                .map_err(|e| {
+                    MetadataFilteringError::MetadataFilteringMetadataSegmentReaderError(e)
+                })?;
+        }
+
         // This will be sorted by offset id.
-        let filter_from_mt_segment = match filtered_index_offset_ids {
-            Ok(res) => {
-                match res {
-                    Some(r) => {
-                        // convert to u32 and also filter out the ones present in the
-                        // materialized log. This is strictly needed for correctness as
-                        // the ids that satisfy the predicate in the metadata segment
-                        // could have been updated more recently (in the log) to NOT
-                        // satisfy the predicate, hence we treat the materialized log
-                        // as the source of truth for ids that are present in both the
-                        // places.
-                        let ids_as_u32: Vec<u32> = r
-                            .into_iter()
-                            .map(|index| index as u32)
-                            .filter(|x| !ids_in_mat_log.contains(x))
-                            .collect();
-                        Some(ids_as_u32)
-                    }
-                    None => None,
-                }
-            }
-            Err(e) => {
-                return Err(MetadataFilteringError::MetadataFilteringMetadataSegmentReaderError(e));
-            }
-        };
+        let mut filter_from_mt_segment: Option<Vec<u32>> = None;
+        if let Some(filtered_index_offset_ids) = filtered_index_offset_ids {
+            // convert to u32 and also filter out the ones present in the
+            // materialized log. This is strictly needed for correctness as
+            // the ids that satisfy the predicate in the metadata segment
+            // could have been updated more recently (in the log) to NOT
+            // satisfy the predicate, hence we treat the materialized log
+            // as the source of truth for ids that are present in both the
+            // places.
+            filter_from_mt_segment = Some(
+                filtered_index_offset_ids
+                    .into_iter()
+                    .map(|index| index as u32)
+                    .filter(|x| !ids_in_mat_log.contains(x))
+                    .collect(),
+            );
+        }
+
         // It cannot happen that one is none and other is some.
         if (filter_from_mt_segment.is_some() && merged_result.is_none())
             || (filter_from_mt_segment.is_none() && merged_result.is_some())
@@ -643,7 +645,7 @@ impl Operator<MetadataFilteringInput, MetadataFilteringOutput> for MetadataFilte
                     let user_id = log_records.merged_user_id_ref();
                     if query_ids_set.contains(user_id) {
                         remaining_id_set.remove(user_id);
-                        if log_records.final_operation != Operation::Delete {
+                        if log_records.final_operation != MaterializedLogOperation::DeleteExisting {
                             user_supplied_offset_ids.push(log_records.offset_id);
                         }
                     }
@@ -726,60 +728,62 @@ impl Operator<MetadataFilteringInput, MetadataFilteringOutput> for MetadataFilte
 
 #[cfg(test)]
 mod test {
-    use std::{
-        collections::HashMap,
-        str::FromStr,
-        sync::{atomic::AtomicU32, Arc},
-    };
-
-    use uuid::Uuid;
-
     use crate::{
-        blockstore::{arrow::provider::ArrowBlockfileProvider, provider::BlockfileProvider},
         execution::{
-            data::data_chunk::Chunk,
             operator::Operator,
             operators::metadata_filtering::{MetadataFilteringInput, MetadataFilteringOperator},
         },
         segment::{
-            metadata_segment::{MetadataSegmentReader, MetadataSegmentWriter},
+            metadata_segment::MetadataSegmentWriter,
             record_segment::{
                 RecordSegmentReader, RecordSegmentReaderCreationError, RecordSegmentWriter,
             },
             types::SegmentFlusher,
             LogMaterializer, SegmentWriter,
         },
-        storage::{local::LocalStorage, Storage},
-        types::{
-            DirectComparison, DirectDocumentComparison, LogRecord, Operation, OperationRecord,
-            UpdateMetadataValue, Where, WhereComparison, WhereDocument,
-        },
     };
+    use chroma_blockstore::{
+        arrow::{config::TEST_MAX_BLOCK_SIZE_BYTES, provider::ArrowBlockfileProvider},
+        provider::BlockfileProvider,
+    };
+    use chroma_cache::{cache::Cache, config::CacheConfig, config::UnboundedCacheConfig};
+    use chroma_storage::{local::LocalStorage, Storage};
+    use chroma_types::{
+        Chunk, DirectComparison, DirectDocumentComparison, LogRecord, Operation, OperationRecord,
+        UpdateMetadataValue, Where, WhereComparison, WhereDocument,
+    };
+    use std::{collections::HashMap, str::FromStr};
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn where_and_where_document_from_log() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let storage = Storage::Local(LocalStorage::new(tmp_dir.path().to_str().unwrap()));
-        let arrow_blockfile_provider = ArrowBlockfileProvider::new(storage);
+        let block_cache = Cache::new(&CacheConfig::Unbounded(UnboundedCacheConfig {}));
+        let sparse_index_cache = Cache::new(&CacheConfig::Unbounded(UnboundedCacheConfig {}));
+        let arrow_blockfile_provider = ArrowBlockfileProvider::new(
+            storage,
+            TEST_MAX_BLOCK_SIZE_BYTES,
+            block_cache,
+            sparse_index_cache,
+        );
         let blockfile_provider =
             BlockfileProvider::ArrowBlockfileProvider(arrow_blockfile_provider);
-        let mut record_segment = crate::types::Segment {
+        let mut record_segment = chroma_types::Segment {
             id: Uuid::from_str("00000000-0000-0000-0000-000000000000").expect("parse error"),
-            r#type: crate::types::SegmentType::BlockfileRecord,
-            scope: crate::types::SegmentScope::RECORD,
-            collection: Some(
-                Uuid::from_str("00000000-0000-0000-0000-000000000000").expect("parse error"),
-            ),
+            r#type: chroma_types::SegmentType::BlockfileRecord,
+            scope: chroma_types::SegmentScope::RECORD,
+            collection: Uuid::from_str("00000000-0000-0000-0000-000000000000")
+                .expect("parse error"),
             metadata: None,
             file_path: HashMap::new(),
         };
-        let mut metadata_segment = crate::types::Segment {
+        let mut metadata_segment = chroma_types::Segment {
             id: Uuid::from_str("00000000-0000-0000-0000-000000000001").expect("parse error"),
-            r#type: crate::types::SegmentType::BlockfileMetadata,
-            scope: crate::types::SegmentScope::METADATA,
-            collection: Some(
-                Uuid::from_str("00000000-0000-0000-0000-000000000000").expect("parse error"),
-            ),
+            r#type: chroma_types::SegmentType::BlockfileMetadata,
+            scope: chroma_types::SegmentScope::METADATA,
+            collection: Uuid::from_str("00000000-0000-0000-0000-000000000000")
+                .expect("parse error"),
             metadata: None,
             file_path: HashMap::new(),
         };
@@ -929,13 +933,13 @@ mod test {
             key: String::from("hello"),
             comparison: WhereComparison::SingleStringComparison(
                 String::from("new_world"),
-                crate::types::WhereClauseComparator::Equal,
+                chroma_types::WhereClauseComparator::Equal,
             ),
         });
         let where_document_clause =
             WhereDocument::DirectWhereDocumentComparison(DirectDocumentComparison {
                 document: String::from("about dogs"),
-                operator: crate::types::WhereDocumentOperator::Contains,
+                operator: chroma_types::WhereDocumentOperator::Contains,
             });
         let input = MetadataFilteringInput::new(
             data.clone(),
@@ -972,26 +976,31 @@ mod test {
     async fn where_from_metadata_segment() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let storage = Storage::Local(LocalStorage::new(tmp_dir.path().to_str().unwrap()));
-        let arrow_blockfile_provider = ArrowBlockfileProvider::new(storage);
+        let block_cache = Cache::new(&CacheConfig::Unbounded(UnboundedCacheConfig {}));
+        let sparse_index_cache = Cache::new(&CacheConfig::Unbounded(UnboundedCacheConfig {}));
+        let arrow_blockfile_provider = ArrowBlockfileProvider::new(
+            storage,
+            TEST_MAX_BLOCK_SIZE_BYTES,
+            block_cache,
+            sparse_index_cache,
+        );
         let blockfile_provider =
             BlockfileProvider::ArrowBlockfileProvider(arrow_blockfile_provider);
-        let mut record_segment = crate::types::Segment {
+        let mut record_segment = chroma_types::Segment {
             id: Uuid::from_str("00000000-0000-0000-0000-000000000000").expect("parse error"),
-            r#type: crate::types::SegmentType::BlockfileRecord,
-            scope: crate::types::SegmentScope::RECORD,
-            collection: Some(
-                Uuid::from_str("00000000-0000-0000-0000-000000000000").expect("parse error"),
-            ),
+            r#type: chroma_types::SegmentType::BlockfileRecord,
+            scope: chroma_types::SegmentScope::RECORD,
+            collection: Uuid::from_str("00000000-0000-0000-0000-000000000000")
+                .expect("parse error"),
             metadata: None,
             file_path: HashMap::new(),
         };
-        let mut metadata_segment = crate::types::Segment {
+        let mut metadata_segment = chroma_types::Segment {
             id: Uuid::from_str("00000000-0000-0000-0000-000000000001").expect("parse error"),
-            r#type: crate::types::SegmentType::BlockfileMetadata,
-            scope: crate::types::SegmentScope::METADATA,
-            collection: Some(
-                Uuid::from_str("00000000-0000-0000-0000-000000000000").expect("parse error"),
-            ),
+            r#type: chroma_types::SegmentType::BlockfileMetadata,
+            scope: chroma_types::SegmentScope::METADATA,
+            collection: Uuid::from_str("00000000-0000-0000-0000-000000000000")
+                .expect("parse error"),
             metadata: None,
             file_path: HashMap::new(),
         };
@@ -1117,7 +1126,7 @@ mod test {
             key: String::from("bye"),
             comparison: WhereComparison::SingleStringComparison(
                 String::from("world"),
-                crate::types::WhereClauseComparator::Equal,
+                chroma_types::WhereClauseComparator::Equal,
             ),
         });
         let input = MetadataFilteringInput::new(
@@ -1155,26 +1164,31 @@ mod test {
     async fn query_ids_only() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let storage = Storage::Local(LocalStorage::new(tmp_dir.path().to_str().unwrap()));
-        let arrow_blockfile_provider = ArrowBlockfileProvider::new(storage);
+        let block_cache = Cache::new(&CacheConfig::Unbounded(UnboundedCacheConfig {}));
+        let sparse_index_cache = Cache::new(&CacheConfig::Unbounded(UnboundedCacheConfig {}));
+        let arrow_blockfile_provider = ArrowBlockfileProvider::new(
+            storage,
+            TEST_MAX_BLOCK_SIZE_BYTES,
+            block_cache,
+            sparse_index_cache,
+        );
         let blockfile_provider =
             BlockfileProvider::ArrowBlockfileProvider(arrow_blockfile_provider);
-        let mut record_segment = crate::types::Segment {
+        let mut record_segment = chroma_types::Segment {
             id: Uuid::from_str("00000000-0000-0000-0000-000000000000").expect("parse error"),
-            r#type: crate::types::SegmentType::BlockfileRecord,
-            scope: crate::types::SegmentScope::RECORD,
-            collection: Some(
-                Uuid::from_str("00000000-0000-0000-0000-000000000000").expect("parse error"),
-            ),
+            r#type: chroma_types::SegmentType::BlockfileRecord,
+            scope: chroma_types::SegmentScope::RECORD,
+            collection: Uuid::from_str("00000000-0000-0000-0000-000000000000")
+                .expect("parse error"),
             metadata: None,
             file_path: HashMap::new(),
         };
-        let mut metadata_segment = crate::types::Segment {
+        let mut metadata_segment = chroma_types::Segment {
             id: Uuid::from_str("00000000-0000-0000-0000-000000000001").expect("parse error"),
-            r#type: crate::types::SegmentType::BlockfileMetadata,
-            scope: crate::types::SegmentScope::METADATA,
-            collection: Some(
-                Uuid::from_str("00000000-0000-0000-0000-000000000000").expect("parse error"),
-            ),
+            r#type: chroma_types::SegmentType::BlockfileMetadata,
+            scope: chroma_types::SegmentScope::METADATA,
+            collection: Uuid::from_str("00000000-0000-0000-0000-000000000000")
+                .expect("parse error"),
             metadata: None,
             file_path: HashMap::new(),
         };

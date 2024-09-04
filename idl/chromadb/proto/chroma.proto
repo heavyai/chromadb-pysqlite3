@@ -43,7 +43,7 @@ message Segment {
     string id = 1;
     string type = 2;
     SegmentScope scope = 3;
-    optional string collection = 5;
+    string collection = 5;
     optional UpdateMetadata metadata = 6;
     map<string,FilePaths> file_paths = 7;
 }
@@ -51,6 +51,7 @@ message Segment {
 message Collection {
   string id = 1;
   string name = 2;
+  string configuration_json_str = 3;
   optional UpdateMetadata metadata = 4;
   optional int32 dimension = 5;
   string tenant = 6;
@@ -101,6 +102,7 @@ service MetadataReader {
 
 message CountRecordsRequest {
     string segment_id = 1;
+    string collection_id = 2;
 }
 
 // TODO: Add error propagation in the response.
@@ -115,6 +117,8 @@ message QueryMetadataRequest {
     repeated string ids = 4;
     optional int32 limit = 5;
     optional int32 offset = 6;
+    string collection_id = 7;
+    bool include_metadata = 8;
 }
 
 message QueryMetadataResponse {
@@ -285,6 +289,7 @@ service VectorReader {
 message GetVectorsRequest {
     repeated string ids = 1;
     string segment_id = 2;
+    string collection_id = 3;
 }
 
 message GetVectorsResponse {
@@ -302,6 +307,7 @@ message QueryVectorsRequest {
     repeated string allowed_ids = 3;
     bool include_embeddings = 4;
     string segment_id = 5;
+    string collection_id = 6;
     // TODO: options as in types.py, its currently unused so can add later
 }
 

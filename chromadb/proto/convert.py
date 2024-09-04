@@ -1,6 +1,7 @@
 import array
 from uuid import UUID
 from typing import Dict, Optional, Tuple, Union, cast
+from chromadb.api.configuration import CollectionConfigurationInternal
 from chromadb.api.types import Embedding
 import chromadb.proto.chroma_pb2 as proto
 from chromadb.types import (
@@ -132,9 +133,7 @@ def from_proto_segment(segment: proto.Segment) -> Segment:
         id=UUID(hex=segment.id),
         type=segment.type,
         scope=from_proto_segment_scope(segment.scope),
-        collection=None
-        if not segment.HasField("collection")
-        else UUID(hex=segment.collection),
+        collection=UUID(hex=segment.collection),
         metadata=from_proto_metadata(segment.metadata)
         if segment.HasField("metadata")
         else None,
@@ -146,7 +145,7 @@ def to_proto_segment(segment: Segment) -> proto.Segment:
         id=segment["id"].hex,
         type=segment["type"],
         scope=to_proto_segment_scope(segment["scope"]),
-        collection=None if segment["collection"] is None else segment["collection"].hex,
+        collection=segment["collection"].hex,
         metadata=None
         if segment["metadata"] is None
         else to_proto_update_metadata(segment["metadata"]),
@@ -203,6 +202,9 @@ def from_proto_collection(collection: proto.Collection) -> Collection:
     return Collection(
         id=UUID(hex=collection.id),
         name=collection.name,
+        configuration=CollectionConfigurationInternal.from_json_str(
+            collection.configuration_json_str
+        ),
         metadata=from_proto_metadata(collection.metadata)
         if collection.HasField("metadata")
         else None,
@@ -219,6 +221,7 @@ def to_proto_collection(collection: Collection) -> proto.Collection:
     return proto.Collection(
         id=collection["id"].hex,
         name=collection["name"],
+        configuration_json_str=collection.get_configuration().to_json_str(),
         metadata=None
         if collection["metadata"] is None
         else to_proto_update_metadata(collection["metadata"]),

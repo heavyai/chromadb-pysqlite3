@@ -1,16 +1,16 @@
 use super::record_segment::ApplyMaterializedLogError;
 use super::{SegmentFlusher, SegmentWriter};
-use crate::errors::{ChromaError, ErrorCodes};
-use crate::index::hnsw_provider::{
-    HnswIndexProvider, HnswIndexProviderCommitError, HnswIndexProviderCreateError,
-    HnswIndexProviderFlushError, HnswIndexProviderForkError, HnswIndexProviderOpenError,
+use async_trait::async_trait;
+use chroma_error::{ChromaError, ErrorCodes};
+use chroma_index::hnsw_provider::{
+    HnswIndexProvider, HnswIndexProviderCreateError, HnswIndexProviderForkError,
+    HnswIndexProviderOpenError,
 };
-use crate::index::{
+use chroma_index::{
     HnswIndex, HnswIndexConfig, HnswIndexFromSegmentError, Index, IndexConfig,
     IndexConfigFromSegmentError,
 };
-use crate::types::{LogRecord, Operation, Segment};
-use async_trait::async_trait;
+use chroma_types::{MaterializedLogOperation, Segment};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -54,7 +54,7 @@ pub enum DistributedHNSWSegmentFromSegmentError {
 }
 
 impl ChromaError for DistributedHNSWSegmentFromSegmentError {
-    fn code(&self) -> crate::errors::ErrorCodes {
+    fn code(&self) -> ErrorCodes {
         match self {
             DistributedHNSWSegmentFromSegmentError::NoHnswFileFound => ErrorCodes::NotFound,
             DistributedHNSWSegmentFromSegmentError::InvalidUUID => ErrorCodes::InvalidArgument,
@@ -156,7 +156,10 @@ impl DistributedHNSWSegmentWriter {
                 segment.id,
             )))
         } else {
-            let index = match hnsw_index_provider.create(segment, dimensionality as i32) {
+            let index = match hnsw_index_provider
+                .create(segment, dimensionality as i32)
+                .await
+            {
                 Ok(index) => index,
                 Err(e) => {
                     return Err(Box::new(
@@ -176,24 +179,17 @@ impl DistributedHNSWSegmentWriter {
 impl<'a> SegmentWriter<'a> for DistributedHNSWSegmentWriter {
     async fn apply_materialized_log_chunk(
         &self,
-        records: crate::execution::data::data_chunk::Chunk<super::MaterializedLogRecord<'a>>,
+        records: chroma_types::Chunk<super::MaterializedLogRecord<'a>>,
     ) -> Result<(), ApplyMaterializedLogError> {
         for (record, _) in records.iter() {
             match record.final_operation {
                 // If embedding is not found in case of adds it means that user
                 // did not supply them and thus we should return an error as
                 // opposed to panic.
-                Operation::Add => {
-                    let embedding = match record.final_embedding {
-                        Some(e) => e,
-                        None => match record.data_record.as_ref() {
-                            Some(record) => record.embedding,
-                            None => {
-                                tracing::error!("Embedding not set for record {:?}", record);
-                                return Err(ApplyMaterializedLogError::EmbeddingNotSet);
-                            }
-                        },
-                    };
+                MaterializedLogOperation::AddNew
+                | MaterializedLogOperation::UpdateExisting
+                | MaterializedLogOperation::OverwriteExisting => {
+                    let embedding = record.merged_embeddings();
 
                     let mut index = self.index.upgradable_read();
                     let index_len = index.len();
@@ -205,50 +201,35 @@ impl<'a> SegmentWriter<'a> for DistributedHNSWSegmentWriter {
                         });
                     }
 
-                    index.add(record.offset_id as usize, embedding);
+                    match index.add(record.offset_id as usize, embedding) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            return Err(ApplyMaterializedLogError::HnswIndexError(e));
+                        }
+                    }
                 }
-                // This shouldn't be reached since materialization always derefs
-                // upserts into either updates or inserts.
-                Operation::Upsert => {
-                    panic!(
-                        "Invariant violation. Upserts should not be present after materialization"
-                    );
-                }
-                Operation::Update => {
-                    // Should panic here if embedding is not found because it likely
-                    // means that somehow our storage is corrupt as data record on
-                    // the record segment does not contain the embedding.
-                    let embedding = match record.final_embedding {
-                        Some(e) => e,
-                        None => match record.data_record.as_ref() {
-                            Some(record) => record.embedding,
-                            None => {
-                                panic!("Invariant violation. Embedding not found on storage");
-                            }
-                        },
-                    };
-                    // HNSW index behavior is to treat add() as upsert so this
-                    // will update the embedding if it exists. It does not
-                    // perform any validation on its own and assumes that the
-                    // offset ids are correct (i.e. pertaining to records that
-                    // are actually meant to be updated).
-                    self.index.read().add(record.offset_id as usize, embedding);
-                }
-                Operation::Delete => {
+                MaterializedLogOperation::DeleteExisting => {
                     // HNSW segment does not perform validation of any sort. So,
                     // the assumption here is that the materialized log records
                     // contain the correct offset ids pertaining to records that
                     // are actually meant to be deleted.
-                    self.index.read().delete(record.offset_id as usize);
+                    match self.index.read().delete(record.offset_id as usize) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            return Err(ApplyMaterializedLogError::HnswIndexError(e));
+                        }
+                    }
                 }
+                MaterializedLogOperation::Initial => panic!(
+                    "Invariant violation. Mat records should not contain logs in initial state"
+                ),
             }
         }
         Ok(())
     }
 
     fn commit(self) -> Result<impl SegmentFlusher, Box<dyn ChromaError>> {
-        let hnsw_index_id = self.index.read().id;
-        let res = self.hnsw_index_provider.commit(&hnsw_index_id);
+        let res = self.hnsw_index_provider.commit(self.index.clone());
         match res {
             Ok(_) => Ok(self),
             Err(e) => Err(e),
@@ -345,17 +326,23 @@ impl DistributedHNSWSegmentReader {
                 }
             };
 
-            let index = match hnsw_index_provider
-                .open(&index_uuid, segment, dimensionality as i32)
-                .await
-            {
-                Ok(index) => index,
-                Err(e) => {
-                    return Err(Box::new(
-                        DistributedHNSWSegmentFromSegmentError::HnswIndexProviderOpenError(*e),
-                    ))
-                }
-            };
+            let index =
+                match hnsw_index_provider.get(&index_uuid, &segment.collection) {
+                    Some(index) => index,
+                    None => {
+                        match hnsw_index_provider
+                            .open(&index_uuid, segment, dimensionality as i32)
+                            .await
+                        {
+                            Ok(index) => index,
+                            Err(e) => return Err(Box::new(
+                                DistributedHNSWSegmentFromSegmentError::HnswIndexProviderOpenError(
+                                    *e,
+                                ),
+                            )),
+                        }
+                    }
+                };
 
             Ok(Box::new(DistributedHNSWSegmentReader::new(
                 index,
@@ -375,7 +362,7 @@ impl DistributedHNSWSegmentReader {
         k: usize,
         allowed_ids: &[usize],
         disallowd_ids: &[usize],
-    ) -> (Vec<usize>, Vec<f32>) {
+    ) -> Result<(Vec<usize>, Vec<f32>), Box<dyn ChromaError>> {
         let index = self.index.read();
         index.query(vector, k, allowed_ids, disallowd_ids)
     }

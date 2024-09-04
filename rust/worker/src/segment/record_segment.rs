@@ -1,11 +1,10 @@
 use super::types::{MaterializedLogRecord, SegmentWriter};
-use super::{DataRecord, SegmentFlusher};
-use crate::blockstore::provider::{BlockfileProvider, CreateError, OpenError};
-use crate::blockstore::{BlockfileFlusher, BlockfileReader, BlockfileWriter};
-use crate::errors::{ChromaError, ErrorCodes};
-use crate::execution::data::data_chunk::Chunk;
-use crate::types::{Operation, Segment, SegmentType};
+use super::SegmentFlusher;
 use async_trait::async_trait;
+use chroma_blockstore::provider::{BlockfileProvider, CreateError, OpenError};
+use chroma_blockstore::{BlockfileFlusher, BlockfileReader, BlockfileWriter};
+use chroma_error::{ChromaError, ErrorCodes};
+use chroma_types::{Chunk, DataRecord, MaterializedLogOperation, Segment, SegmentType};
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::atomic::AtomicU32;
@@ -113,7 +112,7 @@ impl RecordSegmentWriter {
                             return Err(RecordSegmentWriterCreationError::BlockfileCreateError(e))
                         }
                     };
-                    let id_to_user_id = match blockfile_provider.create::<u32, &str>() {
+                    let id_to_user_id = match blockfile_provider.create::<u32, String>() {
                         Ok(id_to_user_id) => id_to_user_id,
                         Err(e) => {
                             return Err(RecordSegmentWriterCreationError::BlockfileCreateError(e))
@@ -240,7 +239,7 @@ impl RecordSegmentWriter {
                         }
                     };
                     let id_to_user_id = match blockfile_provider
-                        .fork::<u32, &str>(&id_to_user_id_bf_uuid)
+                        .fork::<u32, String>(&id_to_user_id_bf_uuid)
                         .await
                     {
                         Ok(id_to_user_id) => id_to_user_id,
@@ -297,16 +296,31 @@ pub enum ApplyMaterializedLogError {
     EmbeddingNotSet,
     #[error("Metadata update not valid")]
     MetadataUpdateNotValid,
+    #[error("Document delete error")]
+    DocumentDeleteError,
+    #[error("FTS Document add error")]
+    FTSDocumentAddError,
+    #[error("FTS Document delete error")]
+    FTSDocumentDeleteError,
+    #[error("FTS Document update error")]
+    FTSDocumentUpdateError,
+    #[error("Error writing to hnsw index")]
+    HnswIndexError(#[from] Box<dyn ChromaError>),
 }
 
 impl ChromaError for ApplyMaterializedLogError {
-    fn code(&self) -> crate::errors::ErrorCodes {
+    fn code(&self) -> ErrorCodes {
         match self {
             ApplyMaterializedLogError::BlockfileSetError => ErrorCodes::Internal,
             ApplyMaterializedLogError::BlockfileDeleteError => ErrorCodes::Internal,
             ApplyMaterializedLogError::BlockfileUpdateError => ErrorCodes::Internal,
             ApplyMaterializedLogError::MetadataUpdateNotValid => ErrorCodes::Internal,
+            ApplyMaterializedLogError::DocumentDeleteError => ErrorCodes::Internal,
+            ApplyMaterializedLogError::FTSDocumentAddError => ErrorCodes::Internal,
+            ApplyMaterializedLogError::FTSDocumentDeleteError => ErrorCodes::Internal,
+            ApplyMaterializedLogError::FTSDocumentUpdateError => ErrorCodes::Internal,
             ApplyMaterializedLogError::EmbeddingNotSet => ErrorCodes::InvalidArgument,
+            ApplyMaterializedLogError::HnswIndexError(_) => ErrorCodes::Internal,
         }
     }
 }
@@ -318,7 +332,7 @@ impl<'a> SegmentWriter<'a> for RecordSegmentWriter {
     ) -> Result<(), ApplyMaterializedLogError> {
         for (log_record, _) in records.iter() {
             match log_record.final_operation {
-                Operation::Add => {
+                MaterializedLogOperation::AddNew => {
                     // Set all four.
                     // Set user id to offset id.
                     match self
@@ -338,7 +352,7 @@ impl<'a> SegmentWriter<'a> for RecordSegmentWriter {
                         .id_to_user_id
                         .as_ref()
                         .unwrap()
-                        .set::<u32, &str>("", log_record.offset_id, log_record.user_id.unwrap())
+                        .set::<u32, String>("", log_record.offset_id, log_record.user_id.unwrap().to_string())
                         .await
                     {
                         Ok(()) => (),
@@ -374,7 +388,7 @@ impl<'a> SegmentWriter<'a> for RecordSegmentWriter {
                         }
                     }
                 }
-                Operation::Update => {
+                MaterializedLogOperation::UpdateExisting | MaterializedLogOperation::OverwriteExisting => {
                     // Offset id and user id do not need to change. Only data
                     // needs to change. Blockfile does not have Read then write
                     // semantics so we'll delete and insert.
@@ -386,7 +400,8 @@ impl<'a> SegmentWriter<'a> for RecordSegmentWriter {
                         .await
                     {
                         Ok(()) => (),
-                        Err(_) => {
+                        Err(e) => {
+                            tracing::error!("Error deleting from user_id_to_id {:?}", e);
                             return Err(ApplyMaterializedLogError::BlockfileDeleteError);
                         }
                     }
@@ -404,12 +419,7 @@ impl<'a> SegmentWriter<'a> for RecordSegmentWriter {
                         }
                     }
                 }
-                Operation::Upsert => {
-                    // MaterializedLogRecord already converts upserts into either updates or inserts
-                    // so here we expect to not have any records of this type.
-                    panic!("Invariant violation. After log materialization there shouldn't be any upserts.");
-                }
-                Operation::Delete => {
+                MaterializedLogOperation::DeleteExisting => {
                     // Delete user id to offset id.
                     match self
                         .user_id_to_id
@@ -419,7 +429,8 @@ impl<'a> SegmentWriter<'a> for RecordSegmentWriter {
                         .await
                     {
                         Ok(()) => (),
-                        Err(_) => {
+                        Err(e) => {
+                            tracing::error!("Error deleting from user_id_to_id {:?}", e);
                             return Err(ApplyMaterializedLogError::BlockfileDeleteError);
                         }
                     };
@@ -428,11 +439,12 @@ impl<'a> SegmentWriter<'a> for RecordSegmentWriter {
                         .id_to_user_id
                         .as_ref()
                         .unwrap()
-                        .delete::<u32, &str>("", log_record.offset_id)
+                        .delete::<u32, String>("", log_record.offset_id)
                         .await
                     {
                         Ok(()) => (),
-                        Err(_) => {
+                        Err(e) => {
+                            tracing::error!("Error deleting from id_to_user_id {:?}", e);
                             return Err(ApplyMaterializedLogError::BlockfileDeleteError);
                         }
                     };
@@ -445,11 +457,13 @@ impl<'a> SegmentWriter<'a> for RecordSegmentWriter {
                         .await
                     {
                         Ok(()) => (),
-                        Err(_) => {
+                        Err(e) => {
+                            tracing::error!("Error deleting from id_to_data {:?}", e);
                             return Err(ApplyMaterializedLogError::BlockfileDeleteError);
                         }
                     }
                 }
+                MaterializedLogOperation::Initial => panic!("Invariant violation. Materialized logs should not have any logs in the initial state")
             }
         }
         Ok(())
@@ -458,7 +472,7 @@ impl<'a> SegmentWriter<'a> for RecordSegmentWriter {
     fn commit(mut self) -> Result<impl SegmentFlusher, Box<dyn ChromaError>> {
         // Commit all the blockfiles
         let flusher_user_id_to_id = self.user_id_to_id.take().unwrap().commit::<&str, u32>();
-        let flusher_id_to_user_id = self.id_to_user_id.take().unwrap().commit::<u32, &str>();
+        let flusher_id_to_user_id = self.id_to_user_id.take().unwrap().commit::<u32, String>();
         let flusher_id_to_data = self.id_to_data.take().unwrap().commit::<u32, &DataRecord>();
         let flusher_max_offset_id = self.max_offset_id.take().unwrap().commit::<&str, u32>();
 
@@ -521,14 +535,14 @@ impl SegmentFlusher for RecordSegmentFlusher {
         let id_to_data_bf_id = self.id_to_data_flusher.id();
         let max_offset_id_bf_id = self.max_offset_id_flusher.id();
         let res_user_id_to_id = self.user_id_to_id_flusher.flush::<&str, u32>().await;
-        let res_id_to_user_id = self.id_to_user_id_flusher.flush::<u32, &str>().await;
+        let res_id_to_user_id = self.id_to_user_id_flusher.flush::<u32, String>().await;
         let res_id_to_data = self.id_to_data_flusher.flush::<u32, &DataRecord>().await;
         let res_max_offset_id = self.max_offset_id_flusher.flush::<&str, u32>().await;
 
         let mut flushed_files = HashMap::new();
 
         match res_user_id_to_id {
-            Ok(f) => {
+            Ok(_) => {
                 flushed_files.insert(
                     USER_ID_TO_OFFSET_ID.to_string(),
                     vec![user_id_to_id_bf_id.to_string()],
@@ -540,7 +554,7 @@ impl SegmentFlusher for RecordSegmentFlusher {
         }
 
         match res_id_to_user_id {
-            Ok(f) => {
+            Ok(_) => {
                 flushed_files.insert(
                     OFFSET_ID_TO_USER_ID.to_string(),
                     vec![id_to_user_id_bf_id.to_string()],
@@ -552,7 +566,7 @@ impl SegmentFlusher for RecordSegmentFlusher {
         }
 
         match res_id_to_data {
-            Ok(f) => {
+            Ok(_) => {
                 flushed_files.insert(
                     OFFSET_ID_TO_DATA.to_string(),
                     vec![id_to_data_bf_id.to_string()],
@@ -579,6 +593,7 @@ impl SegmentFlusher for RecordSegmentFlusher {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct RecordSegmentReader<'me> {
     user_id_to_id: BlockfileReader<'me, &'me str, u32>,
     id_to_user_id: BlockfileReader<'me, u32, &'me str>,
@@ -783,6 +798,11 @@ impl RecordSegmentReader<'_> {
                     data.push(data_record);
                 }
                 Err(e) => {
+                    tracing::error!(
+                        "[GetAllData] Error getting data record for index {:?}: {:?}",
+                        i,
+                        e
+                    );
                     return Err(e);
                 }
             }
@@ -790,7 +810,53 @@ impl RecordSegmentReader<'_> {
         Ok(data)
     }
 
+    /// Returns all ids in the record segment sorted.
+    pub(crate) async fn get_all_user_ids(&self) -> Result<Vec<&str>, Box<dyn ChromaError>> {
+        let mut ids = Vec::new();
+        let max_size = self.user_id_to_id.count().await?;
+        for i in 0..max_size {
+            let res = self.user_id_to_id.get_at_index(i).await;
+            match res {
+                Ok((_, user_id, _)) => {
+                    ids.push(user_id);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "[GetAllData] Error getting user id for index {:?}: {:?}",
+                        i,
+                        e
+                    );
+                    return Err(e);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
     pub(crate) async fn count(&self) -> Result<usize, Box<dyn ChromaError>> {
-        self.id_to_data.count().await
+        // We query using the id_to_user_id blockfile since it is likely to be the smallest
+        // and count loads all the data
+        // In the future, we can optimize this by making the underlying blockfile
+        // store counts in the sparse index.
+        self.id_to_user_id.count().await
+    }
+
+    pub(crate) async fn prefetch_id_to_data(&self, keys: &[u32]) -> () {
+        let prefixes = vec![""; keys.len()];
+        self.id_to_data.load_blocks_for_keys(&prefixes, keys).await
+    }
+
+    pub(crate) async fn prefetch_user_id_to_id(&self, keys: Vec<&str>) -> () {
+        let prefixes = vec![""; keys.len()];
+        self.user_id_to_id
+            .load_blocks_for_keys(&prefixes, &keys)
+            .await
+    }
+
+    pub(crate) async fn prefetch_id_to_user_id(&self, keys: &[u32]) -> () {
+        let prefixes = vec![""; keys.len()];
+        self.id_to_user_id
+            .load_blocks_for_keys(&prefixes, keys)
+            .await
     }
 }

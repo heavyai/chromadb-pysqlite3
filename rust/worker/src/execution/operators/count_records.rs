@@ -1,10 +1,10 @@
 use crate::{
-    blockstore::provider::{BlockfileProvider, OpenError},
-    errors::{ChromaError, ErrorCodes},
-    execution::{data::data_chunk::Chunk, operator::Operator},
+    execution::operator::Operator,
     segment::record_segment::{RecordSegmentReader, RecordSegmentReaderCreationError},
-    types::{LogRecord, Operation, Segment},
 };
+use chroma_blockstore::provider::BlockfileProvider;
+use chroma_error::{ChromaError, ErrorCodes};
+use chroma_types::{Chunk, LogRecord, Operation, Segment};
 use std::collections::HashSet;
 use thiserror::Error;
 use tonic::async_trait;
@@ -64,6 +64,11 @@ impl ChromaError for CountRecordsError {
 #[async_trait]
 impl Operator<CountRecordsInput, CountRecordsOutput> for CountRecordsOperator {
     type Error = CountRecordsError;
+
+    fn get_name(&self) -> &'static str {
+        "CountRecordsOperator"
+    }
+
     async fn run(
         &self,
         input: &CountRecordsInput,
@@ -78,6 +83,7 @@ impl Operator<CountRecordsInput, CountRecordsOutput> for CountRecordsOperator {
             Err(e) => {
                 match *e {
                     RecordSegmentReaderCreationError::UninitializedSegment => {
+                        tracing::info!("[CountQueryOrchestrator] Record segment is uninitialized");
                         // This means there no compaction has occured.
                         // So we can just traverse the log records
                         // and count the number of records.
@@ -191,30 +197,27 @@ mod tests {
     use crate::segment::types::SegmentFlusher;
     use crate::segment::LogMaterializer;
     use crate::{
-        blockstore::provider::BlockfileProvider,
         execution::{
-            data::data_chunk::Chunk,
             operator::Operator,
             operators::count_records::{CountRecordsInput, CountRecordsOperator},
         },
         segment::{record_segment::RecordSegmentWriter, SegmentWriter},
-        types::{LogRecord, Operation, OperationRecord},
     };
-    use std::sync::atomic::AtomicU32;
-    use std::sync::Arc;
+    use chroma_blockstore::provider::BlockfileProvider;
+    use chroma_types::{Chunk, LogRecord, Operation, OperationRecord};
     use std::{collections::HashMap, str::FromStr};
+    use tracing::{Instrument, Span};
     use uuid::Uuid;
 
     #[tokio::test]
     async fn test_merge_log_and_storage() {
         let in_memory_provider = BlockfileProvider::new_memory();
-        let mut record_segment = crate::types::Segment {
+        let mut record_segment = chroma_types::Segment {
             id: Uuid::from_str("00000000-0000-0000-0000-000000000000").expect("parse error"),
-            r#type: crate::types::SegmentType::BlockfileRecord,
-            scope: crate::types::SegmentScope::RECORD,
-            collection: Some(
-                Uuid::from_str("00000000-0000-0000-0000-000000000000").expect("parse error"),
-            ),
+            r#type: chroma_types::SegmentType::BlockfileRecord,
+            scope: chroma_types::SegmentScope::RECORD,
+            collection: Uuid::from_str("00000000-0000-0000-0000-000000000000")
+                .expect("parse error"),
             metadata: None,
             file_path: HashMap::new(),
         };
@@ -285,6 +288,7 @@ mod tests {
             let materializer = LogMaterializer::new(record_segment_reader, data, None);
             let mat_records = materializer
                 .materialize()
+                .instrument(tracing::trace_span!(parent: Span::current(), "Materialize logs"))
                 .await
                 .expect("Log materialization failed");
             segment_writer
@@ -348,13 +352,12 @@ mod tests {
     #[tokio::test]
     async fn test_no_compaction_log_only() {
         let in_memory_provider = BlockfileProvider::new_memory();
-        let record_segment = crate::types::Segment {
+        let record_segment = chroma_types::Segment {
             id: Uuid::from_str("00000000-0000-0000-0000-000000000000").expect("parse error"),
-            r#type: crate::types::SegmentType::BlockfileRecord,
-            scope: crate::types::SegmentScope::RECORD,
-            collection: Some(
-                Uuid::from_str("00000000-0000-0000-0000-000000000000").expect("parse error"),
-            ),
+            r#type: chroma_types::SegmentType::BlockfileRecord,
+            scope: chroma_types::SegmentScope::RECORD,
+            collection: Uuid::from_str("00000000-0000-0000-0000-000000000000")
+                .expect("parse error"),
             metadata: None,
             file_path: HashMap::new(),
         };

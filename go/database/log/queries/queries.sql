@@ -32,4 +32,16 @@ UPDATE collection set record_enumeration_offset_position = $2 where id = $1;
 INSERT INTO collection (id, record_enumeration_offset_position, record_compaction_offset_position) values($1, $2, $3) returning *;
 
 -- name: PurgeRecords :exec
-DELETE FROM record_log r using collection c where r.collection_id = c.id and r.offset < c.record_compaction_offset_position;
+DELETE FROM record_log r using collection c where r.collection_id = c.id and r.offset <= c.record_compaction_offset_position;
+
+-- name: GetTotalUncompactedRecordsCount :one
+SELECT CAST(COALESCE(SUM(record_enumeration_offset_position - record_compaction_offset_position), 0) AS bigint) AS total_uncompacted_depth FROM collection;
+
+-- name: DeleteRecords :exec
+DELETE FROM record_log r where r.collection_id = ANY(@collection_ids::text[]);
+
+-- name: DeleteCollection :exec
+DELETE FROM collection c where c.id = ANY(@collection_ids::text[]);
+
+-- name: GetAllCollections :many
+SELECT id FROM collection;

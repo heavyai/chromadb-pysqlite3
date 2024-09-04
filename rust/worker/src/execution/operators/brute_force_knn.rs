@@ -1,23 +1,20 @@
-use crate::blockstore::provider::BlockfileProvider;
-use crate::errors::ChromaError;
-use crate::errors::ErrorCodes;
-use crate::execution::data::data_chunk::Chunk;
+use crate::execution::operator::Operator;
 use crate::execution::operators::normalize_vectors::normalize;
 use crate::segment::record_segment::RecordSegmentReader;
 use crate::segment::LogMaterializer;
 use crate::segment::LogMaterializerError;
-use crate::segment::MaterializedLogRecord;
-use crate::types::LogRecord;
-use crate::types::Operation;
-use crate::types::Segment;
-use crate::{distance::DistanceFunction, execution::operator::Operator};
 use async_trait::async_trait;
+use chroma_blockstore::provider::BlockfileProvider;
+use chroma_distance::DistanceFunction;
+use chroma_error::{ChromaError, ErrorCodes};
+use chroma_types::Chunk;
+use chroma_types::{LogRecord, MaterializedLogOperation, Segment};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::trace;
+use tracing::Instrument;
+use tracing::Span;
 
 /// The brute force k-nearest neighbors operator is responsible for computing the k-nearest neighbors
 /// of a given query vector against a set of vectors using brute force calculation.
@@ -39,9 +36,6 @@ pub struct BruteForceKnnOperatorInput {
     pub k: usize,
     pub distance_metric: DistanceFunction,
     pub allowed_ids: Arc<[String]>,
-    // This is just a subset of allowed_ids containing
-    // only the ids that are allowed and present in the log.
-    pub allowed_ids_brute_force: Arc<[String]>,
     // Deps to create the log materializer
     pub record_segment_definition: Segment,
     pub blockfile_provider: BlockfileProvider,
@@ -118,6 +112,10 @@ impl ChromaError for BruteForceKnnOperatorError {
 impl Operator<BruteForceKnnOperatorInput, BruteForceKnnOperatorOutput> for BruteForceKnnOperator {
     type Error = BruteForceKnnOperatorError;
 
+    fn get_name(&self) -> &'static str {
+        "BruteForceKnnOperator"
+    }
+
     async fn run(
         &self,
         input: &BruteForceKnnOperatorInput,
@@ -137,7 +135,11 @@ impl Operator<BruteForceKnnOperatorInput, BruteForceKnnOperatorOutput> for Brute
             }
         };
         let log_materializer = LogMaterializer::new(record_segment_reader, input.log.clone(), None);
-        let logs = match log_materializer.materialize().await {
+        let logs = match log_materializer
+            .materialize()
+            .instrument(tracing::trace_span!(parent: Span::current(), "Materialize logs"))
+            .await
+        {
             Ok(logs) => logs,
             Err(e) => {
                 return Err(BruteForceKnnOperatorError::LogMaterializationError(e));
@@ -159,7 +161,7 @@ impl Operator<BruteForceKnnOperatorInput, BruteForceKnnOperatorOutput> for Brute
         for data in data_chunk.iter() {
             let log_record = data.0;
 
-            if log_record.final_operation == Operation::Delete {
+            if log_record.final_operation == MaterializedLogOperation::DeleteExisting {
                 // Explicitly skip deleted records.
                 continue;
             }
@@ -169,9 +171,7 @@ impl Operator<BruteForceKnnOperatorInput, BruteForceKnnOperatorOutput> for Brute
             // Empty allowed list is passed when where filtering is absent.
             // TODO: This should not need to use merged_user_id, which clones the id.
             if !input.allowed_ids.is_empty()
-                && !input
-                    .allowed_ids_brute_force
-                    .contains(&log_record.merged_user_id())
+                && !input.allowed_ids.contains(&log_record.merged_user_id())
             {
                 continue;
             }
@@ -226,9 +226,7 @@ impl Operator<BruteForceKnnOperatorInput, BruteForceKnnOperatorOutput> for Brute
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::LogRecord;
-    use crate::types::Operation;
-    use crate::types::OperationRecord;
+    use chroma_types::{LogRecord, Operation, OperationRecord};
     use std::collections::HashMap;
     use uuid::uuid;
 
@@ -240,9 +238,9 @@ mod tests {
         // Create an empty record segment definition
         let record_segment_definition = Segment {
             id: uuid!("00000000-0000-0000-0000-000000000000"),
-            r#type: crate::types::SegmentType::BlockfileRecord,
-            scope: crate::types::SegmentScope::RECORD,
-            collection: Some(uuid!("00000000-0000-0000-0000-000000000000")),
+            r#type: chroma_types::SegmentType::BlockfileRecord,
+            scope: chroma_types::SegmentScope::RECORD,
+            collection: uuid!("00000000-0000-0000-0000-000000000000"),
             metadata: None,
             file_path: HashMap::new(),
         };
@@ -297,7 +295,6 @@ mod tests {
             k: 2,
             distance_metric: DistanceFunction::Euclidean,
             allowed_ids: Arc::new([]),
-            allowed_ids_brute_force: Arc::new([]),
             blockfile_provider,
             record_segment_definition,
         };
@@ -366,7 +363,6 @@ mod tests {
             k: 2,
             distance_metric: DistanceFunction::InnerProduct,
             allowed_ids: Arc::new([]),
-            allowed_ids_brute_force: Arc::new([]),
             blockfile_provider,
             record_segment_definition,
         };
@@ -411,7 +407,6 @@ mod tests {
             k: 2,
             distance_metric: DistanceFunction::Euclidean,
             allowed_ids: Arc::new([]),
-            allowed_ids_brute_force: Arc::new([]),
             blockfile_provider,
             record_segment_definition,
         };
@@ -470,7 +465,6 @@ mod tests {
             k: 2,
             distance_metric: DistanceFunction::Euclidean,
             allowed_ids: Arc::new([]),
-            allowed_ids_brute_force: Arc::new([]),
             blockfile_provider,
             record_segment_definition,
         };
@@ -534,7 +528,6 @@ mod tests {
             k: 2,
             distance_metric: DistanceFunction::Euclidean,
             allowed_ids: Arc::new([]),
-            allowed_ids_brute_force: Arc::new([]),
             blockfile_provider,
             record_segment_definition,
         };

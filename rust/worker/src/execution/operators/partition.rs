@@ -1,8 +1,7 @@
-use crate::errors::{ChromaError, ErrorCodes};
-use crate::execution::data::data_chunk::Chunk;
 use crate::execution::operator::Operator;
-use crate::types::LogRecord;
 use async_trait::async_trait;
+use chroma_error::{ChromaError, ErrorCodes};
+use chroma_types::{Chunk, LogRecord};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -124,6 +123,10 @@ impl PartitionOperator {
 impl Operator<PartitionInput, PartitionOutput> for PartitionOperator {
     type Error = PartitionError;
 
+    fn get_name(&self) -> &'static str {
+        "PartitionOperator"
+    }
+
     async fn run(&self, input: &PartitionInput) -> Result<PartitionOutput, PartitionError> {
         let records = &input.records;
         let partition_size = self.determine_partition_size(records.len(), input.max_partition_size);
@@ -137,7 +140,7 @@ impl Operator<PartitionInput, PartitionOutput> for PartitionOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{LogRecord, Operation, OperationRecord};
+    use chroma_types::{LogRecord, Operation, OperationRecord};
     use std::sync::Arc;
 
     #[tokio::test]

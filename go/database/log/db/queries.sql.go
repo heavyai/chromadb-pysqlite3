@@ -9,6 +9,48 @@ import (
 	"context"
 )
 
+const deleteCollection = `-- name: DeleteCollection :exec
+DELETE FROM collection c where c.id = ANY($1::text[])
+`
+
+func (q *Queries) DeleteCollection(ctx context.Context, collectionIds []string) error {
+	_, err := q.db.Exec(ctx, deleteCollection, collectionIds)
+	return err
+}
+
+const deleteRecords = `-- name: DeleteRecords :exec
+DELETE FROM record_log r where r.collection_id = ANY($1::text[])
+`
+
+func (q *Queries) DeleteRecords(ctx context.Context, collectionIds []string) error {
+	_, err := q.db.Exec(ctx, deleteRecords, collectionIds)
+	return err
+}
+
+const getAllCollections = `-- name: GetAllCollections :many
+SELECT id FROM collection
+`
+
+func (q *Queries) GetAllCollections(ctx context.Context) ([]string, error) {
+	rows, err := q.db.Query(ctx, getAllCollections)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getAllCollectionsToCompact = `-- name: GetAllCollectionsToCompact :many
 with summary as (
     select r.collection_id, r.offset, r.timestamp, row_number() over(partition by r.collection_id order by r.offset) as rank
@@ -109,6 +151,17 @@ func (q *Queries) GetRecordsForCollection(ctx context.Context, arg GetRecordsFor
 	return items, nil
 }
 
+const getTotalUncompactedRecordsCount = `-- name: GetTotalUncompactedRecordsCount :one
+SELECT CAST(COALESCE(SUM(record_enumeration_offset_position - record_compaction_offset_position), 0) AS bigint) AS total_uncompacted_depth FROM collection
+`
+
+func (q *Queries) GetTotalUncompactedRecordsCount(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, getTotalUncompactedRecordsCount)
+	var total_uncompacted_depth int64
+	err := row.Scan(&total_uncompacted_depth)
+	return total_uncompacted_depth, err
+}
+
 const insertCollection = `-- name: InsertCollection :one
 INSERT INTO collection (id, record_enumeration_offset_position, record_compaction_offset_position) values($1, $2, $3) returning id, record_compaction_offset_position, record_enumeration_offset_position
 `
@@ -134,7 +187,7 @@ type InsertRecordParams struct {
 }
 
 const purgeRecords = `-- name: PurgeRecords :exec
-DELETE FROM record_log r using collection c where r.collection_id = c.id and r.offset < c.record_compaction_offset_position
+DELETE FROM record_log r using collection c where r.collection_id = c.id and r.offset <= c.record_compaction_offset_position
 `
 
 func (q *Queries) PurgeRecords(ctx context.Context) error {

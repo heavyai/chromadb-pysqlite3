@@ -1,33 +1,23 @@
 mod assignment;
-mod blockstore;
 mod compactor;
 mod config;
-pub mod distance;
-mod errors;
 mod execution;
-mod index;
 mod log;
 mod memberlist;
 mod segment;
 mod server;
-mod storage;
 mod sysdb;
 mod system;
 mod tracing;
-mod types;
 mod utils;
 
-use config::Configurable;
+use chroma_config::Configurable;
 use memberlist::MemberlistProvider;
 
 use tokio::select;
 use tokio::signal::unix::{signal, SignalKind};
 
 const CONFIG_PATH_ENV_VAR: &str = "CONFIG_PATH";
-
-mod chroma_proto {
-    tonic::include_proto!("chroma");
-}
 
 pub async fn query_service_entrypoint() {
     // Check if the config path is set in the env var
@@ -61,7 +51,7 @@ pub async fn query_service_entrypoint() {
         }
     };
     worker_server.set_system(system.clone());
-    worker_server.set_dispatcher(dispatcher_handle.receiver());
+    worker_server.set_dispatcher(dispatcher_handle.clone());
 
     let server_join_handle = tokio::spawn(async move {
         let _ = crate::server::WorkerServer::run(worker_server).await;
@@ -134,7 +124,7 @@ pub async fn compaction_service_entrypoint() {
                 return;
             }
         };
-    compaction_manager.set_dispatcher(dispatcher_handle.receiver());
+    compaction_manager.set_dispatcher(dispatcher_handle.clone());
     compaction_manager.set_system(system.clone());
 
     let mut compaction_manager_handle = system.start_component(compaction_manager);
